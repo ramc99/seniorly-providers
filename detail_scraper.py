@@ -56,6 +56,7 @@ DELAY_MS     = 2000
 RESTART_EVERY = 15
 
 BROWSER_ARGS = [
+    "--incognito",
     "--no-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
@@ -402,37 +403,40 @@ async def new_page(p, headless: bool):
 
 # ── Worker ─────────────────────────────────────────────────────────────────────
 
+async def scrape_one(url: str, headless: bool, download_imgs: bool,
+                     client: httpx.AsyncClient) -> dict:
+    """Open a fresh browser for one community, scrape it, then quit."""
+    async with async_playwright() as p:
+        browser, page = await new_page(p, headless)
+        try:
+            return await scrape_community(page, url, download_imgs, client)
+        finally:
+            await browser.close()
+            log.info("  Browser closed for: %s", url.split("/")[-1])
+
+
 async def worker(worker_id: int, queue: asyncio.Queue, headless: bool,
                  download_imgs: bool, client: httpx.AsyncClient,
                  csv_writer, csv_lock: asyncio.Lock, csv_file):
     done = 0
-    async with async_playwright() as p:
-        browser, page = await new_page(p, headless)
+    while True:
+        url = await queue.get()
+        if url is None:
+            queue.put_nowait(None)   # re-add sentinel
+            break
+
         try:
-            while True:
-                url = await queue.get()
-                if url is None:
-                    queue.put_nowait(None)   # re-add sentinel
-                    break
+            result = await scrape_one(url, headless, download_imgs, client)
+            if result.get("_csv_row"):
+                async with csv_lock:
+                    csv_writer.writerow(result["_csv_row"])
+                    csv_file.flush()
+        except Exception as e:
+            log.error("Worker %d error on %s: %s", worker_id, url, e)
 
-                try:
-                    result = await scrape_community(page, url, download_imgs, client)
-                    if result.get("_csv_row"):
-                        async with csv_lock:
-                            csv_writer.writerow(result["_csv_row"])
-                            csv_file.flush()
-                except Exception as e:
-                    log.error("Worker %d error on %s: %s", worker_id, url, e)
+        done += 1
+        await asyncio.sleep(DELAY_MS / 1000)
 
-                done += 1
-                if done % RESTART_EVERY == 0:
-                    await browser.close()
-                    log.info("Worker %d restarting browser (%d done)", worker_id, done)
-                    browser, page = await new_page(p, headless)
-
-                await asyncio.sleep(DELAY_MS / 1000)
-        finally:
-            await browser.close()
     log.info("Worker %d finished (%d communities)", worker_id, done)
 
 

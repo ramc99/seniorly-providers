@@ -49,6 +49,7 @@ CARE_TYPE_PREFIXES = (
 FIELDS = ["provider_name", "provider_url", "name", "address", "services", "price", "rating", "url"]
 
 BROWSER_ARGS = [
+    "--incognito",
     "--no-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
