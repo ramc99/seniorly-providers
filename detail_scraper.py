@@ -38,11 +38,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-OUTPUT_DIR  = Path(__file__).parent / "outputs"
-DATA_DIR    = OUTPUT_DIR / "data"
-IMAGES_DIR  = OUTPUT_DIR / "images"
-DEFAULT_CSV = OUTPUT_DIR / "providers_communities.csv"
-OUT_CSV     = OUTPUT_DIR / "communities_detail.csv"
+OUTPUT_DIR      = Path(__file__).parent / "outputs"
+COMMUNITIES_DIR = OUTPUT_DIR / "communities"
+DEFAULT_CSV     = OUTPUT_DIR / "providers_communities.csv"
+OUT_CSV         = OUTPUT_DIR / "communities_detail.csv"
 
 CSV_FIELDS = [
     "name", "slug", "url", "address", "city", "state", "zip",
@@ -273,7 +272,7 @@ async def _extract_html_fallback(page) -> dict:
 
 async def download_images(img_urls: list[str], slug: str, client: httpx.AsyncClient) -> list[str]:
     """Download images concurrently. Returns list of saved filenames."""
-    dest_dir = IMAGES_DIR / slug
+    dest_dir = COMMUNITIES_DIR / slug
     dest_dir.mkdir(parents=True, exist_ok=True)
     saved = []
 
@@ -304,11 +303,14 @@ async def download_images(img_urls: list[str], slug: str, client: httpx.AsyncCli
 
 async def scrape_community(page, url: str, download_imgs: bool, client: httpx.AsyncClient) -> dict:
     slug = url_to_slug(url)
-    json_path = DATA_DIR / f"{slug}.json"
+    community_dir = COMMUNITIES_DIR / slug
+    json_path = community_dir / "data.json"
 
     if json_path.exists():
         log.info("  Skip (done): %s", slug[:60])
         return {"skipped": True, "url": url}
+
+    community_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("  Scraping: %s", url)
     data = {"url": url, "slug": slug}
@@ -357,10 +359,23 @@ async def scrape_community(page, url: str, download_imgs: bool, client: httpx.As
     else:
         data["images_saved"] = []
 
-    # Save JSON
+    # Save JSON inside community folder
     json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+    # Save per-community CSV named after the community slug
+    community_name = (data.get("slug") or slug.split("_")[-1]).strip("_") or slug
+    csv_path = community_dir / f"{community_name}.csv"
+    flat = {}
+    for f in CSV_FIELDS:
+        v = data.get(f, "")
+        flat[f] = json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else (v if v is not None else "")
+    with open(csv_path, "w", newline="", encoding="utf-8") as cf:
+        w = csv.DictWriter(cf, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        w.writerow(flat)
+
     log.info("  Saved: %s  (%d images, %s)",
-             data.get("name", slug)[:50], len(img_urls), json_path.name)
+             data.get("name", slug)[:50], len(img_urls), community_dir.name)
 
     # Flatten for CSV
     flat = {}
@@ -425,8 +440,7 @@ async def worker(worker_id: int, queue: asyncio.Queue, headless: bool,
 
 async def run(input_csv: Path, headless: bool = True, limit: int = 0,
               workers: int = 2, download_imgs: bool = True):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    COMMUNITIES_DIR.mkdir(parents=True, exist_ok=True)
 
     if not input_csv.exists():
         log.error("Input CSV not found: %s", input_csv)
@@ -448,7 +462,7 @@ async def run(input_csv: Path, headless: bool = True, limit: int = 0,
         urls = urls[:limit]
 
     # Skip already done
-    pending = [u for u in urls if not (DATA_DIR / f"{url_to_slug(u)}.json").exists()]
+    pending = [u for u in urls if not (COMMUNITIES_DIR / url_to_slug(u) / "data.json").exists()]
     log.info("%d unique URLs, %d pending, %d workers", len(urls), len(pending), workers)
 
     if not pending:
