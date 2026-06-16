@@ -65,7 +65,7 @@ UA = (
 # ── Browser helper ─────────────────────────────────────────────────────────────
 
 async def new_page(p, headless: bool):
-    browser = await p.chromium.launch(headless=headless, slow_mo=30, args=BROWSER_ARGS)
+    browser = await p.chromium.launch(headless=headless, args=BROWSER_ARGS)
     ctx = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=UA)
     page = await ctx.new_page()
     await page.add_init_script(
@@ -76,10 +76,12 @@ async def new_page(p, headless: bool):
 
 # ── Provider list ──────────────────────────────────────────────────────────────
 
+RESTART_EVERY = 15
+
 async def get_provider_hrefs(page) -> list[dict]:
     """Return [{name, url}] for all providers on /providers."""
     log.info("Loading %s …", PROVIDERS_URL)
-    await page.goto(PROVIDERS_URL, wait_until="networkidle", timeout=60_000)
+    await page.goto(PROVIDERS_URL, wait_until="load", timeout=60_000)
     await page.wait_for_timeout(2000)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await page.wait_for_timeout(1500)
@@ -110,18 +112,20 @@ async def get_provider_hrefs(page) -> list[dict]:
 # ── Community extraction ───────────────────────────────────────────────────────
 
 def _is_community_href(href: str) -> bool:
+    if href.startswith("https://www.seniorly.com"):
+        href = href[len("https://www.seniorly.com"):]
     return any(href.startswith(p) for p in CARE_TYPE_PREFIXES) and href.count("/") >= 4
 
 
 async def _extract_community_card(card) -> dict | None:
     """Extract data from one community card element."""
     try:
-        link = card.locator("a[href]").first
-        if not await link.count():
-            return None
-        href = await link.get_attribute("href") or ""
-        if not _is_community_href(href):
-            # Try any link in the card
+        # The <a href> wraps the <article> as its parent
+        href = await card.evaluate(
+            "el => (el.closest('a[href]') || el.parentElement || {}).getAttribute?.('href') || ''"
+        ) or ""
+        if not href:
+            # Fallback: any link inside the card
             for a in await card.locator("a[href]").all():
                 h = await a.get_attribute("href") or ""
                 if _is_community_href(h):
@@ -130,7 +134,10 @@ async def _extract_community_card(card) -> dict | None:
         if not _is_community_href(href):
             return None
 
-        url = BASE_URL + href if href.startswith("/") else href
+        if href.startswith("http"):
+            url = href
+        else:
+            url = BASE_URL + href
         text = (await card.inner_text()).strip()
 
         # Parse name — first non-empty line
@@ -193,8 +200,8 @@ async def scrape_provider_communities(page, provider: dict) -> list[dict]:
 
     log.info("[%s] Loading %s", pname, url)
     try:
-        await page.goto(url, wait_until="networkidle", timeout=60_000)
-        await page.wait_for_timeout(2000)
+        await page.goto(url, wait_until="load", timeout=60_000)
+        await page.wait_for_timeout(1500)
     except PlaywrightTimeout:
         log.warning("[%s] Timeout loading provider page", pname)
         return results
@@ -293,11 +300,62 @@ def save_checkpoint(done: set):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+async def _worker(worker_id: int, queue: asyncio.Queue, headless: bool,
+                  csv_writer, csv_file, lock: asyncio.Lock, done: set):
+    """One worker — pulls providers from queue, reuses browser, restarts every RESTART_EVERY."""
+    browser = page = None
+    count = 0
+
+    async with async_playwright() as p:
+        while True:
+            pv = await queue.get()
+            if pv is None:
+                queue.put_nowait(None)  # re-add sentinel for other workers
+                break
+
+            # Launch or restart browser
+            if browser is None or count % RESTART_EVERY == 0:
+                if browser:
+                    await browser.close()
+                    log.info("[W%d] Browser restarted after %d providers", worker_id, count)
+                browser, page = await new_page(p, headless)
+
+            try:
+                communities = await scrape_provider_communities(page, pv)
+            except Exception as e:
+                log.error("[W%d] Error on %s: %s", worker_id, pv["name"], e)
+                communities = []
+
+            # Per-provider CSV
+            safe_name = re.sub(r"[^\w-]", "_", pv["name"]).strip("_") or "provider"
+            provider_csv = OUTPUT_DIR / f"{safe_name}_phase1.csv"
+            with open(provider_csv, "w", newline="", encoding="utf-8") as pf:
+                pw = csv.DictWriter(pf, fieldnames=FIELDS)
+                pw.writeheader()
+                for c in communities:
+                    pw.writerow({f: c.get(f, "") for f in FIELDS})
+
+            async with lock:
+                for c in communities:
+                    csv_writer.writerow({f: c.get(f, "") for f in FIELDS})
+                csv_file.flush()
+                done.add(pv["url"])
+                save_checkpoint(done)
+                log.info("[W%d] Saved %d communities for [%s] → %s", worker_id, len(communities), pv["name"], provider_csv.name)
+
+            count += 1
+
+        if browser:
+            await browser.close()
+
+    log.info("[W%d] Done (%d providers)", worker_id, count)
+
+
 async def run(headless: bool = True, limit: int = 0, workers: int = 2):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     done = load_checkpoint()
 
-    # Phase 1 — get provider list
+    # Get provider list using a single short-lived browser
     async with async_playwright() as p:
         browser, page = await new_page(p, headless)
         try:
@@ -311,6 +369,10 @@ async def run(headless: bool = True, limit: int = 0, workers: int = 2):
     pending = [pv for pv in providers if pv["url"] not in done]
     log.info("%d providers total, %d pending, %d workers", len(providers), len(pending), workers)
 
+    if not pending:
+        log.info("All providers already done.")
+        return
+
     # Open CSV (append mode so we can resume)
     is_new = not OUT_CSV.exists()
     csv_file   = open(OUT_CSV, "a", newline="", encoding="utf-8")
@@ -320,30 +382,16 @@ async def run(headless: bool = True, limit: int = 0, workers: int = 2):
     csv_file.flush()
 
     lock = asyncio.Lock()
+    queue: asyncio.Queue = asyncio.Queue()
+    for pv in pending:
+        queue.put_nowait(pv)
+    queue.put_nowait(None)  # sentinel
 
-    async def process_provider(pv: dict):
-        async with async_playwright() as p:
-            browser, page = await new_page(p, headless)
-            try:
-                communities = await scrape_provider_communities(page, pv)
-            finally:
-                await browser.close()
+    await asyncio.gather(*[
+        _worker(i + 1, queue, headless, csv_writer, csv_file, lock, done)
+        for i in range(workers)
+    ])
 
-        async with lock:
-            for c in communities:
-                csv_writer.writerow({f: c.get(f, "") for f in FIELDS})
-            csv_file.flush()
-            done.add(pv["url"])
-            save_checkpoint(done)
-            log.info("Saved %d communities for [%s]", len(communities), pv["name"])
-
-    sem = asyncio.Semaphore(workers)
-
-    async def throttled(pv):
-        async with sem:
-            await process_provider(pv)
-
-    await asyncio.gather(*[throttled(pv) for pv in pending])
     csv_file.close()
     log.info("Done. Output → %s", OUT_CSV)
 

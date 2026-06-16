@@ -29,7 +29,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -300,9 +300,27 @@ async def download_images(img_urls: list[str], slug: str, client: httpx.AsyncCli
     return saved
 
 
+# ── CSV helper ─────────────────────────────────────────────────────────────────
+
+def _write_community_csv(data: dict, slug: str, community_dir: Path, provider_name: str = "") -> dict:
+    """Write per-community CSV and return the flat row dict."""
+    safe = re.sub(r"[^\w-]", "_", provider_name).strip("_") if provider_name else ""
+    fname = f"{safe}_phase2" if safe else ((data.get("slug") or slug.split("_")[-1]).strip("_") or slug)
+    csv_path = community_dir / f"{fname}.csv"
+    flat = {}
+    for f in CSV_FIELDS:
+        v = data.get(f, "")
+        flat[f] = json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else (v if v is not None else "")
+    with open(csv_path, "w", newline="", encoding="utf-8") as cf:
+        w = csv.DictWriter(cf, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        w.writerow(flat)
+    return flat
+
+
 # ── Per-community scraper ──────────────────────────────────────────────────────
 
-async def scrape_community(page, url: str, download_imgs: bool, client: httpx.AsyncClient) -> dict:
+async def scrape_community(page, url: str, download_imgs: bool, client: httpx.AsyncClient, provider_name: str = "") -> dict:
     slug = url_to_slug(url)
     community_dir = COMMUNITIES_DIR / slug
     json_path = community_dir / "data.json"
@@ -317,16 +335,17 @@ async def scrape_community(page, url: str, download_imgs: bool, client: httpx.As
     data = {"url": url, "slug": slug}
 
     try:
-        await page.goto(url, wait_until="load", timeout=60_000)
+        await page.goto(url, wait_until="load", timeout=10_000)
         await page.wait_for_timeout(1000)
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(800)
         await page.evaluate("window.scrollTo(0, 0)")
         await page.wait_for_timeout(300)
-    except PlaywrightTimeout:
-        log.warning("  Timeout: %s", url)
-        data["error"] = "timeout"
-        return data
+    except (PlaywrightTimeout, PlaywrightError) as e:
+        log.warning("  Network error (%s): %s", type(e).__name__, url)
+        data["error"] = str(e)[:120]
+        flat = _write_community_csv(data, slug, community_dir, provider_name)
+        return {**data, "_csv_row": flat}
 
     # Try __NEXT_DATA__ first
     raw_nd = await page.evaluate(
@@ -362,29 +381,11 @@ async def scrape_community(page, url: str, download_imgs: bool, client: httpx.As
     # Save JSON inside community folder
     json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
-    # Save per-community CSV named after the community slug
-    community_name = (data.get("slug") or slug.split("_")[-1]).strip("_") or slug
-    csv_path = community_dir / f"{community_name}.csv"
-    flat = {}
-    for f in CSV_FIELDS:
-        v = data.get(f, "")
-        flat[f] = json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else (v if v is not None else "")
-    with open(csv_path, "w", newline="", encoding="utf-8") as cf:
-        w = csv.DictWriter(cf, fieldnames=CSV_FIELDS)
-        w.writeheader()
-        w.writerow(flat)
+    flat = _write_community_csv(data, slug, community_dir)
 
     log.info("  Saved: %s  (%d images, %s)",
              data.get("name", slug)[:50], len(img_urls), community_dir.name)
 
-    # Flatten for CSV
-    flat = {}
-    for f in CSV_FIELDS:
-        v = data.get(f, "")
-        if isinstance(v, (list, dict)):
-            flat[f] = json.dumps(v, ensure_ascii=False)
-        else:
-            flat[f] = v if v is not None else ""
     return {**data, "_csv_row": flat}
 
 
@@ -411,10 +412,13 @@ async def worker(worker_id: int, queue: asyncio.Queue, headless: bool,
 
     async with async_playwright() as p:
         while True:
-            url = await queue.get()
-            if url is None:
+            item = await queue.get()
+            if item is None:
                 queue.put_nowait(None)
                 break
+
+            url           = item["url"]
+            provider_name = item.get("provider_name", "")
 
             # Launch or restart browser
             if browser is None or done % RESTART_EVERY == 0:
@@ -424,13 +428,19 @@ async def worker(worker_id: int, queue: asyncio.Queue, headless: bool,
                 browser, page = await new_page(p, headless)
 
             try:
-                result = await scrape_community(page, url, download_imgs, client)
+                result = await scrape_community(page, url, download_imgs, client, provider_name)
                 if result.get("_csv_row"):
                     async with csv_lock:
                         csv_writer.writerow(result["_csv_row"])
                         csv_file.flush()
             except Exception as e:
                 log.error("Worker %d error on %s: %s", worker_id, url, e)
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                browser = page = None
 
             done += 1
             await asyncio.sleep(DELAY_MS / 1000)
@@ -454,29 +464,29 @@ async def run(input_csv: Path, headless: bool = True, limit: int = 0,
     with open(input_csv, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    urls = []
+    items = []
     seen = set()
     for row in rows:
         url = row.get("url") or row.get("URL") or row.get("community_url") or ""
         url = url.strip()
         if url and url not in seen:
             seen.add(url)
-            urls.append(url)
+            items.append({"url": url, "provider_name": row.get("provider_name", "")})
 
     if limit:
-        urls = urls[:limit]
+        items = items[:limit]
 
     # Skip already done
-    pending = [u for u in urls if not (COMMUNITIES_DIR / url_to_slug(u) / "data.json").exists()]
-    log.info("%d unique URLs, %d pending, %d workers", len(urls), len(pending), workers)
+    pending = [it for it in items if not (COMMUNITIES_DIR / url_to_slug(it["url"]) / "data.json").exists()]
+    log.info("%d unique URLs, %d pending, %d workers", len(items), len(pending), workers)
 
     if not pending:
         log.info("All communities already scraped.")
         return
 
     queue: asyncio.Queue = asyncio.Queue()
-    for u in pending:
-        queue.put_nowait(u)
+    for it in pending:
+        queue.put_nowait(it)
     queue.put_nowait(None)   # sentinel
 
     is_new = not OUT_CSV.exists()
