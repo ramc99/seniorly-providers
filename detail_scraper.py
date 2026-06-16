@@ -42,6 +42,14 @@ OUTPUT_DIR  = Path(__file__).parent / "outputs"
 DATA_DIR    = OUTPUT_DIR / "data"
 IMAGES_DIR  = OUTPUT_DIR / "images"
 DEFAULT_CSV = OUTPUT_DIR / "providers_communities.csv"
+OUT_CSV     = OUTPUT_DIR / "communities_detail.csv"
+
+CSV_FIELDS = [
+    "name", "slug", "url", "address", "city", "state", "zip",
+    "phone", "email", "website", "care_types", "pricing",
+    "rating", "review_count", "verified", "best_of",
+    "description", "amenities", "image_count", "lat", "lng",
+]
 
 MAX_IMAGES   = 50
 IMG_SIZE     = "1920"     # replace thumbnail size with this in cdn URLs
@@ -353,7 +361,16 @@ async def scrape_community(page, url: str, download_imgs: bool, client: httpx.As
     json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     log.info("  Saved: %s  (%d images, %s)",
              data.get("name", slug)[:50], len(img_urls), json_path.name)
-    return data
+
+    # Flatten for CSV
+    flat = {}
+    for f in CSV_FIELDS:
+        v = data.get(f, "")
+        if isinstance(v, (list, dict)):
+            flat[f] = json.dumps(v, ensure_ascii=False)
+        else:
+            flat[f] = v if v is not None else ""
+    return {**data, "_csv_row": flat}
 
 
 # ── Browser helper ─────────────────────────────────────────────────────────────
@@ -371,7 +388,8 @@ async def new_page(p, headless: bool):
 # ── Worker ─────────────────────────────────────────────────────────────────────
 
 async def worker(worker_id: int, queue: asyncio.Queue, headless: bool,
-                 download_imgs: bool, client: httpx.AsyncClient):
+                 download_imgs: bool, client: httpx.AsyncClient,
+                 csv_writer, csv_lock: asyncio.Lock, csv_file):
     done = 0
     async with async_playwright() as p:
         browser, page = await new_page(p, headless)
@@ -383,7 +401,11 @@ async def worker(worker_id: int, queue: asyncio.Queue, headless: bool,
                     break
 
                 try:
-                    await scrape_community(page, url, download_imgs, client)
+                    result = await scrape_community(page, url, download_imgs, client)
+                    if result.get("_csv_row"):
+                        async with csv_lock:
+                            csv_writer.writerow(result["_csv_row"])
+                            csv_file.flush()
                 except Exception as e:
                     log.error("Worker %d error on %s: %s", worker_id, url, e)
 
@@ -438,14 +460,24 @@ async def run(input_csv: Path, headless: bool = True, limit: int = 0,
         queue.put_nowait(u)
     queue.put_nowait(None)   # sentinel
 
+    is_new = not OUT_CSV.exists()
+    csv_file   = open(OUT_CSV, "a", newline="", encoding="utf-8")
+    csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+    if is_new:
+        csv_writer.writeheader()
+    csv_lock = asyncio.Lock()
+
     async with httpx.AsyncClient(
         headers={"User-Agent": UA},
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     ) as client:
         await asyncio.gather(*[
-            worker(i + 1, queue, headless, download_imgs, client)
+            worker(i + 1, queue, headless, download_imgs, client, csv_writer, csv_lock, csv_file)
             for i in range(workers)
         ])
+
+    csv_file.close()
+    log.info("CSV → %s", OUT_CSV)
 
     log.info("Done. Data → %s  Images → %s", DATA_DIR, IMAGES_DIR)
 
