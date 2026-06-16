@@ -317,13 +317,12 @@ async def scrape_community(page, url: str, download_imgs: bool, client: httpx.As
     data = {"url": url, "slug": slug}
 
     try:
-        await page.goto(url, wait_until="networkidle", timeout=60_000)
-        await page.wait_for_timeout(1500)
-        # Scroll to trigger lazy-loaded images
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.goto(url, wait_until="load", timeout=60_000)
         await page.wait_for_timeout(1000)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(800)
         await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(300)
     except PlaywrightTimeout:
         log.warning("  Timeout: %s", url)
         data["error"] = "timeout"
@@ -392,7 +391,7 @@ async def scrape_community(page, url: str, download_imgs: bool, client: httpx.As
 # ── Browser helper ─────────────────────────────────────────────────────────────
 
 async def new_page(p, headless: bool):
-    browser = await p.chromium.launch(headless=headless, slow_mo=30, args=BROWSER_ARGS)
+    browser = await p.chromium.launch(headless=headless, args=BROWSER_ARGS)
     ctx = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=UA)
     page = await ctx.new_page()
     await page.add_init_script(
@@ -403,39 +402,41 @@ async def new_page(p, headless: bool):
 
 # ── Worker ─────────────────────────────────────────────────────────────────────
 
-async def scrape_one(url: str, headless: bool, download_imgs: bool,
-                     client: httpx.AsyncClient) -> dict:
-    """Open a fresh browser for one community, scrape it, then quit."""
-    async with async_playwright() as p:
-        browser, page = await new_page(p, headless)
-        try:
-            return await scrape_community(page, url, download_imgs, client)
-        finally:
-            await browser.close()
-            log.info("  Browser closed for: %s", url.split("/")[-1])
-
-
 async def worker(worker_id: int, queue: asyncio.Queue, headless: bool,
                  download_imgs: bool, client: httpx.AsyncClient,
                  csv_writer, csv_lock: asyncio.Lock, csv_file):
+    """Reuses one browser per worker, restarts every RESTART_EVERY communities."""
     done = 0
-    while True:
-        url = await queue.get()
-        if url is None:
-            queue.put_nowait(None)   # re-add sentinel
-            break
+    browser = page = None
 
-        try:
-            result = await scrape_one(url, headless, download_imgs, client)
-            if result.get("_csv_row"):
-                async with csv_lock:
-                    csv_writer.writerow(result["_csv_row"])
-                    csv_file.flush()
-        except Exception as e:
-            log.error("Worker %d error on %s: %s", worker_id, url, e)
+    async with async_playwright() as p:
+        while True:
+            url = await queue.get()
+            if url is None:
+                queue.put_nowait(None)
+                break
 
-        done += 1
-        await asyncio.sleep(DELAY_MS / 1000)
+            # Launch or restart browser
+            if browser is None or done % RESTART_EVERY == 0:
+                if browser:
+                    await browser.close()
+                    log.info("  [W%d] Browser restarted after %d communities", worker_id, done)
+                browser, page = await new_page(p, headless)
+
+            try:
+                result = await scrape_community(page, url, download_imgs, client)
+                if result.get("_csv_row"):
+                    async with csv_lock:
+                        csv_writer.writerow(result["_csv_row"])
+                        csv_file.flush()
+            except Exception as e:
+                log.error("Worker %d error on %s: %s", worker_id, url, e)
+
+            done += 1
+            await asyncio.sleep(DELAY_MS / 1000)
+
+        if browser:
+            await browser.close()
 
     log.info("Worker %d finished (%d communities)", worker_id, done)
 
@@ -497,7 +498,7 @@ async def run(input_csv: Path, headless: bool = True, limit: int = 0,
     csv_file.close()
     log.info("CSV → %s", OUT_CSV)
 
-    log.info("Done. Data → %s  Images → %s", DATA_DIR, IMAGES_DIR)
+    log.info("Done. Data → %s  Images → %s", COMMUNITIES_DIR, OUTPUT_DIR / "images")
 
 
 def main():
