@@ -1,0 +1,19 @@
+# Stage 2 outputs
+output/
+test_output/
+
+# Test artifacts
+test_phoenix.csv
+test_2cities.csv
+test_checkpoint.json
+checkpoint.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
