@@ -5,12 +5,16 @@ Resume-safe: tracks completed cities in checkpoint.json.
 If stopped (Ctrl+C, crash, etc.), restart the script — it skips already-done
 cities and continues from the exact stop point.
 
+Parallel: --workers N runs N cities simultaneously (default 2).
+Each worker opens its own fresh incognito headless driver per city.
+
 Output (per city):
   output/<state>/<city>_<state>.csv          — main paginated listings
   output/<state>/<city>_<state>_nearby.csv   — featured/nearby listings (if any)
 
 Usage:
     python stage2_scraper.py
+    python stage2_scraper.py --workers 2
     python stage2_scraper.py --cities-csv all_cities.csv
     python stage2_scraper.py --output-dir output --checkpoint checkpoint.json
 """
@@ -21,7 +25,9 @@ import json
 import math
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from selenium import webdriver
@@ -232,6 +238,7 @@ def main() -> None:
     parser.add_argument("--cities-csv",  default="all_cities.csv")
     parser.add_argument("--output-dir",  default="output")
     parser.add_argument("--checkpoint",  default="checkpoint.json")
+    parser.add_argument("--workers",     type=int, default=2, help="Parallel cities (default: 2)")
     parser.add_argument("--headless",    action="store_true", default=True)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     args = parser.parse_args()
@@ -258,39 +265,66 @@ def main() -> None:
         print("All cities already scraped.")
         return
 
-    print(f"Driver opens/closes per city (fresh incognito session each time).\n")
+    workers = args.workers
+    print(f"Running {workers} cities in parallel. Fresh incognito driver per city.\n")
 
-    try:
-        for idx, city_row in enumerate(remaining, start=1):
-            city_url   = city_row["url"]
-            city_name  = city_row["city"]
-            state_name = city_row["state"]
-            done_count = len(completed)
+    # Thread-safe checkpoint lock — multiple workers write completed at the same time
+    ckpt_lock   = threading.Lock()
+    print_lock  = threading.Lock()
+    stop_event  = threading.Event()
 
-            print(f"[{done_count + idx}/{total_cities}] {state_name} / {city_name}")
+    def process_city(city_row: dict, position: int) -> None:
+        if stop_event.is_set():
+            return
+
+        city_url   = city_row["url"]
+        city_name  = city_row["city"]
+        state_name = city_row["state"]
+
+        with print_lock:
+            print(f"[{position}/{total_cities}] {state_name} / {city_name}")
             print(f"    {city_url}")
 
-            # Open a fresh driver for every city
-            driver = make_driver(headless=args.headless)
-            try:
-                listings = scrape_city(driver, city_url)
-                if listings:
-                    save_city_csvs(listings, city_url, output_dir)
-                completed.add(city_url)
-            except Exception as e:
-                print(f"    ERROR: {e} — will retry on next run")
-            finally:
-                driver.quit()
+        driver = make_driver(headless=args.headless)
+        try:
+            listings = scrape_city(driver, city_url)
+            if listings:
+                save_city_csvs(listings, city_url, output_dir)
 
-            # Save checkpoint after every city (whether success or error)
-            save_checkpoint(checkpoint_p, completed)
+            with ckpt_lock:
+                completed.add(city_url)
+                save_checkpoint(checkpoint_p, completed)
+
+            with print_lock:
+                main_n   = sum(1 for l in listings if l["card_type"] == "main")
+                nearby_n = sum(1 for l in listings if l["card_type"] == "extra")
+                print(f"    ✓ {city_name} — main={main_n} nearby={nearby_n}")
+
+        except Exception as e:
+            with print_lock:
+                print(f"    ✗ {city_name} ERROR: {e} — will retry on next run")
+        finally:
+            driver.quit()
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(process_city, city_row, len(completed) + idx): city_row
+                for idx, city_row in enumerate(remaining, start=1)
+            }
+            for future in as_completed(futures):
+                future.result()  # re-raise any unhandled exception
 
     except KeyboardInterrupt:
+        stop_event.set()
         print("\n\nStopped by user. Progress saved to checkpoint.json")
-        print(f"Completed: {len(completed)}/{total_cities} cities")
+        with ckpt_lock:
+            print(f"Completed: {len(completed)}/{total_cities} cities")
         print("Re-run the script to resume from this point.")
 
-    print(f"\nDone. {len(completed)}/{total_cities} cities scraped.")
+    with ckpt_lock:
+        done = len(completed)
+    print(f"\nDone. {done}/{total_cities} cities scraped.")
 
 
 if __name__ == "__main__":
